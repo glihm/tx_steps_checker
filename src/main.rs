@@ -2,9 +2,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use once_cell::sync::Lazy;
 use starknet::core::types::requests::GetTransactionReceiptRequest;
-use starknet::core::types::{
-    BlockId, BlockTag, EventFilter, Felt, TransactionReceipt,
-};
+use starknet::core::types::{BlockId, BlockTag, EventFilter, Felt, TransactionReceipt};
 use starknet::macros::felt;
 use starknet::providers::jsonrpc::HttpTransport;
 use starknet::providers::{JsonRpcClient, Provider, ProviderRequestData, ProviderResponseData};
@@ -32,7 +30,6 @@ const TX_HASH_BATCH_SIZE: usize = 1000;
 
 /// The chunk size for fetching events, 1024 being the maximum value for pathfinder.
 const EVENT_CHUNK_SIZE: u64 = 1024;
-
 
 pub static CONTRACTS: Lazy<HashMap<&str, (Felt, u64, String)>> = Lazy::new(|| {
     HashMap::from([
@@ -104,8 +101,31 @@ impl Contract {
 #[command(name = "sn_events_batch")]
 #[command(about = "Fetch events and transaction receipts for the contract.")]
 struct Args {
+    #[command(flatten)]
+    contract_config: ContractConfig,
+}
+
+#[derive(clap::Args)]
+struct ContractConfig {
+    /// Use a predefined contract.
     #[arg(short, long)]
-    contract: Contract,
+    #[arg(conflicts_with("contract_address"))]
+    contract: Option<Contract>,
+
+    /// Custom contract address.
+    #[arg(long)]
+    #[arg(conflicts_with("contract"))]
+    contract_address: Option<Felt>,
+
+    /// Custom start block number.
+    #[arg(long)]
+    #[arg(default_value = "0")]
+    start_block: u64,
+
+    /// Custom RPC URL.
+    #[arg(long)]
+    #[arg(default_value = CARTRIDGE_NODE_MAINNET)]
+    rpc_url: String,
 }
 
 #[derive(Error, Debug)]
@@ -114,26 +134,13 @@ pub enum FetchError {
     Provider(#[from] starknet::providers::ProviderError),
 }
 
-/// Ensures the file is deleted and recreated blank since we only append after.
-fn setup_file(file_name: &str) -> File {
-    if let Err(e) = std::fs::remove_file(file_name) {
-        error!("Error deleting file: {}", e);
-    }
-
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file_name)
-        .expect("Failed to open file")
-}
-
 #[tokio::main]
 async fn main() -> Result<(), FetchError> {
     let args = Args::parse();
 
-    let (contract_address, start_block, rpc) = args.contract.get_details();
+    let (contract_address, start_block, rpc, contract_name) = parse_contract_config(&args);
 
-    let mut output_file = setup_file(&format!("/tmp/{:?}.log", args.contract));
+    let mut output_file = setup_file(&format!("/tmp/{}.log", contract_name));
 
     let filter_layer = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -153,8 +160,8 @@ async fn main() -> Result<(), FetchError> {
     let mut total_events = 0;
 
     info!(
-        "Starting event fetch for contract: {:?} (address: {:#x}, start_block: {})",
-        args.contract, contract_address, start_block
+        "Starting event fetch for contract: {} (address: {:#x}, start_block: {})",
+        contract_name, contract_address, start_block
     );
 
     loop {
@@ -176,11 +183,16 @@ async fn main() -> Result<(), FetchError> {
                 .block_number
                 .unwrap()
         };
-        debug!(
-            "Fetched {} events (highest block: {})",
-            events_page.events.len(),
-            current_block
-        );
+
+        if !events_page.events.is_empty() {
+            debug!(
+                "Fetched {} events (highest block: {})",
+                events_page.events.len(),
+                current_block
+            );
+        } else {
+            debug!("Empty page");
+        }
 
         // Adds the tx hashes to the queue to be batched later.
         for event in &events_page.events {
@@ -193,7 +205,7 @@ async fn main() -> Result<(), FetchError> {
 
         if tx_hash_queue.len() >= TX_HASH_BATCH_SIZE {
             let batch: Vec<Felt> = tx_hash_queue.drain(..TX_HASH_BATCH_SIZE).collect();
-            batch_txs_receipts(&provider, &batch, &mut output_file).await?;
+            fetch_and_process_txs_receipts(&provider, &batch, &mut output_file).await?;
         }
 
         continuation_token = events_page.continuation_token;
@@ -205,7 +217,7 @@ async fn main() -> Result<(), FetchError> {
     // We need to make sure we drain remainig tx if we don't reach the tx batch size:
     if !tx_hash_queue.is_empty() {
         let batch: Vec<Felt> = tx_hash_queue.drain(..).collect();
-        batch_txs_receipts(&provider, &batch, &mut output_file).await?;
+        fetch_and_process_txs_receipts(&provider, &batch, &mut output_file).await?;
     }
 
     info!("Total events fetched: {total_events}");
@@ -214,6 +226,40 @@ async fn main() -> Result<(), FetchError> {
     Ok(())
 }
 
+/// Process the batch of txs receipts and write to the output file.
+async fn fetch_and_process_txs_receipts<P: Provider + Sync + Send + 'static>(
+    provider: &Arc<P>,
+    tx_hashes: &[Felt],
+    output_file: &mut File,
+) -> Result<(), FetchError> {
+    let receipts = fetch_receipts_batch(provider, tx_hashes).await?;
+    let mut high_step_count = 0;
+
+    for r in &receipts {
+        if let TransactionReceipt::Invoke(r) = r {
+            let steps = r.execution_resources.computation_resources.steps;
+
+            if steps > TX_STEPS_THRESHOLD {
+                high_step_count += 1;
+                println!("{:#066x} ({} steps)", r.transaction_hash, steps);
+                writeln!(output_file, "{:#066x} {} *", r.transaction_hash, steps).unwrap();
+            } else {
+                writeln!(output_file, "{:#066x} {}", r.transaction_hash, steps).unwrap();
+            }
+        }
+    }
+
+    info!(
+        "Fetched {} receipts (batch), {} with > {} steps",
+        receipts.len(),
+        high_step_count,
+        TX_STEPS_THRESHOLD,
+    );
+
+    Ok(())
+}
+
+/// Fetches transaction receipts in batch.
 async fn fetch_receipts_batch<P: Provider + Sync + Send + 'static>(
     provider: &Arc<P>,
     tx_hashes: &[Felt],
@@ -239,37 +285,33 @@ async fn fetch_receipts_batch<P: Provider + Sync + Send + 'static>(
     Ok(receipts)
 }
 
-async fn batch_txs_receipts<P: Provider + Sync + Send + 'static>(
-    provider: &Arc<P>,
-    tx_hashes: &[Felt],
-    output_file: &mut File,
-) -> Result<(), FetchError> {
-    let receipts = fetch_receipts_batch(&provider, &tx_hashes).await?;
-    let mut high_step_count = 0;
-
-    for r in &receipts {
-        match r {
-            TransactionReceipt::Invoke(r) => {
-                let steps = r.execution_resources.computation_resources.steps;
-
-                if steps > TX_STEPS_THRESHOLD {
-                    high_step_count += 1;
-                    println!("{:#066x} ({} steps)", r.transaction_hash, steps);
-                    writeln!(output_file, "{:#066x} {} *", r.transaction_hash, steps).unwrap();
-                } else {
-                    writeln!(output_file, "{:#066x} {}", r.transaction_hash, steps).unwrap();
-                }
-            }
-            _ => {}
-        }
+/// Ensures the file is deleted and recreated blank since we only append after.
+fn setup_file(file_name: &str) -> File {
+    if let Err(e) = std::fs::remove_file(file_name) {
+        error!("Error deleting file: {}", e);
     }
 
-    info!(
-        "Fetched {} receipts (batch), {} with > {} steps",
-        receipts.len(),
-        high_step_count,
-        TX_STEPS_THRESHOLD,
-    );
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_name)
+        .expect("Failed to open file")
+}
 
-    Ok(())
+/// Parse command line arguments and return contract configuration
+fn parse_contract_config(args: &Args) -> (Felt, u64, String, String) {
+    if let Some(contract) = &args.contract_config.contract {
+        let (addr, block, rpc_url) = contract.get_details();
+        (addr, block, rpc_url, format!("{:?}", contract))
+    } else if let Some(address) = args.contract_config.contract_address {
+        (
+            address,
+            args.contract_config.start_block,
+            args.contract_config.rpc_url.clone(),
+            "Custom".to_string(),
+        )
+    } else {
+        error!("No contract specified");
+        std::process::exit(1);
+    }
 }
