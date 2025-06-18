@@ -123,11 +123,11 @@ enum Contract {
 impl Contract {
     fn get_details(&self) -> (Felt, u64, String) {
         match self {
-            Contract::EternumS0 => CONTRACTS["Eternum_s0"].clone(),
-            Contract::EternumS1 => CONTRACTS["Eternum_s1"].clone(),
-            Contract::Zkube => CONTRACTS["Zkube"].clone(),
-            Contract::Ryo => CONTRACTS["Ryo"].clone(),
-            Contract::RyoKatana => CONTRACTS["RyoKatana"].clone(),
+            Contract::EternumS0 => CONTRACTS["eternum_s0"].clone(),
+            Contract::EternumS1 => CONTRACTS["eternum_s1"].clone(),
+            Contract::Zkube => CONTRACTS["zkube"].clone(),
+            Contract::Ryo => CONTRACTS["ryo"].clone(),
+            Contract::RyoKatana => CONTRACTS["ryokatana"].clone(),
         }
     }
 }
@@ -161,6 +161,12 @@ struct ContractConfig {
     #[arg(long)]
     #[arg(default_value = CARTRIDGE_NODE_MAINNET)]
     rpc_url: String,
+
+    /// Custom contract name.
+    /// Use the contract address by default.
+    #[arg(long)]
+    #[arg(default_value = "")]
+    contract_name: String,
 }
 
 #[derive(Error, Debug)]
@@ -416,7 +422,11 @@ fn parse_contract_config(args: &Args) -> (Felt, u64, String, String) {
             address,
             args.contract_config.start_block,
             args.contract_config.rpc_url.clone(),
-            "Custom".to_string(),
+            if args.contract_config.contract_name.is_empty() {
+                format!("{:#066x}", address)
+            } else {
+                args.contract_config.contract_name.clone()
+            },
         )
     } else {
         error!("No contract specified");
