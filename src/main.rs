@@ -5,9 +5,9 @@ use clap::ValueEnum;
 use once_cell::sync::Lazy;
 use starknet::core::types::ContractClass;
 use starknet::core::types::InvokeTransaction;
+use starknet::core::types::LegacyContractAbiEntry;
 use starknet::core::types::Transaction;
 use starknet::core::types::contract::AbiEntry;
-use starknet::core::types::contract::AbiFunction;
 use starknet::core::types::requests::GetTransactionReceiptRequest;
 use starknet::core::types::{BlockId, BlockTag, EventFilter, Felt, TransactionReceipt};
 use starknet::core::utils::get_selector_from_name;
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
 use tracing::trace;
+use tracing::warn;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
@@ -299,9 +300,10 @@ async fn fetch_and_process_txs_receipts<P: Provider + Sync + Send + 'static>(
                 {
                     writeln!(
                         output_file,
-                        "{:#066x} {} * {}",
+                        "{:#066x} {} * [{}] {}",
                         r.transaction_hash,
                         steps,
+                        tx_info.entrypoints_names.len(),
                         tx_info.entrypoints_names.join(", ")
                     )
                     .unwrap();
@@ -378,12 +380,43 @@ async fn fetch_and_parse_transaction<P: Provider + Sync + Send + 'static>(
     // We're looking for `execution_from_outside_v3` since most of txs are controller txs.
     // The first call is being parsed, and the selector is the third element in this array (since execution from outside itself is not multicalled).
     if tx.calldata[2] != selector!("execute_from_outside_v3") {
-        debug!(tx_hash = ?tx_hash, "Not an execution from outside v3 transaction.");
-        return Ok(None);
+        // Decode simple calldata (New encoding only).
+        let mut n: usize = tx.calldata[0]
+            .try_into()
+            .expect("Number of calls is too big");
+        // We skip the length of the calldata already decoded.
+        let mut offset = 1;
+
+        let mut entrypoints_names: Vec<String> = vec![];
+
+        while n != 0 {
+            let to = tx.calldata[offset];
+            let selector = tx.calldata[offset + 1];
+            let call_data_len: usize = tx.calldata[offset + 2]
+                .try_into()
+                .expect("Call data length is too big");
+            debug!(tx_hash = ?tx_hash, to = ?to, selector = ?selector, call_data_len = ?call_data_len, "Decoding new encoding call.");
+            let function_name = if let Some(n) = get_function_name(function_cache, selector) {
+                n
+            } else {
+                fetch_and_decode_entrypoints(to, provider, function_cache).await?;
+                get_function_name(function_cache, selector).unwrap()
+            };
+
+            entrypoints_names.push(function_name);
+
+            offset += 3 + call_data_len;
+            n -= 1;
+        }
+
+        assert_eq!(offset, tx.calldata.len());
+
+        return Ok(Some(HighStepTxInfo { entrypoints_names }));
     }
 
     let mut entrypoints_names: Vec<String> = vec![];
     let efo = OutsideExecutionV3::cairo_deserialize(&tx.calldata, 4).unwrap();
+    debug!(tx_hash = ?tx_hash, "Decoding outside execution v3.");
 
     for call in &efo.calls {
         let function_name = if let Some(n) = get_function_name(function_cache, call.selector) {
@@ -442,11 +475,10 @@ async fn fetch_and_decode_entrypoints<P: Provider + Sync + Send + 'static>(
 ) -> Result<(), FetchError> {
     /// An AbiEntry that is a function can be embedded in an interface (which is then implemented).
     /// This function is handy to re-use the same code for both functions and implementations.
-    fn decode_function(function: &AbiFunction, function_cache: &mut FunctionCache) {
-        let name = function.name.clone();
-        let selector = get_selector_from_name(&function.name).expect("Invalid function name");
-        debug!(function_name = name, selector = ?selector, "Registering mapping for function");
-        store_function_name(function_cache, selector, name);
+    fn decode_function(function_name: &str, function_cache: &mut FunctionCache) {
+        let selector = get_selector_from_name(function_name).expect("Invalid function name");
+        debug!(function_name = function_name, selector = ?selector, "Registering mapping for function");
+        store_function_name(function_cache, selector, function_name.to_string());
     }
     trace!("Fetching ABI for contract: {:#x}", contract_address);
 
@@ -459,15 +491,25 @@ async fn fetch_and_decode_entrypoints<P: Provider + Sync + Send + 'static>(
         let abi = serde_json::from_str::<Vec<AbiEntry>>(&class.abi).unwrap();
         for entry in abi {
             if let AbiEntry::Function(function) = entry {
-                decode_function(&function, function_cache);
+                decode_function(&function.name, function_cache);
             } else if let AbiEntry::Interface(intf) = entry {
                 for item in &intf.items {
                     if let AbiEntry::Function(function) = item {
-                        decode_function(function, function_cache);
+                        decode_function(&function.name, function_cache);
                     }
                 }
             }
         }
+    } else if let ContractClass::Legacy(class) = class {
+        if let Some(abi) = class.abi {
+            for entry in abi {
+                if let LegacyContractAbiEntry::Function(function) = entry {
+                    decode_function(&function.name, function_cache);
+                }
+            }
+        }
+    } else {
+        warn!(contract_address = ?contract_address, "Unsupported contract class.");
     }
 
     Ok(())
