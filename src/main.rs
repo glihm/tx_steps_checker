@@ -97,8 +97,7 @@ pub static CONTRACTS: Lazy<HashMap<&str, (Felt, u64, String)>> = Lazy::new(|| {
             "Ryo",
             (
                 felt!("0x4f3dccb47477c087ad9c76b8067b8aadded57f8df7f2d7543e6066bcb25332c"),
-                //889000,
-                909695, // debug for big tx.
+                889000,
                 String::from(CARTRIDGE_NODE_MAINNET),
             ),
         ),
