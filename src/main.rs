@@ -29,7 +29,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
 
-pub const LOG_TARGET: &str = "sn_tx_steps";
 const CARTRIDGE_NODE_MAINNET: &str = "https://api.cartridge.gg/x/starknet/mainnet";
 const RYO_KATANA_RPC: &str = "https://api.cartridge.gg/x/dopewars/katana";
 

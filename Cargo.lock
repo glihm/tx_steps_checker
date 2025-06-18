@@ -2835,30 +2835,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "sn_events_batch"
-version = "0.1.0"
-dependencies = [
- "account_sdk",
- "bitflags 2.9.1",
- "cainome-cairo-serde",
- "clap",
- "futures",
- "futures-util",
- "hashlink",
- "once_cell",
- "serde",
- "serde_json",
- "starknet 0.12.0",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-log 0.1.4",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3535,6 +3511,30 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 2.0.102",
+]
+
+[[package]]
+name = "tx_steps_checker"
+version = "0.1.0"
+dependencies = [
+ "account_sdk",
+ "bitflags 2.9.1",
+ "cainome-cairo-serde",
+ "clap",
+ "futures",
+ "futures-util",
+ "hashlink",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "starknet 0.12.0",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-log 0.1.4",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
