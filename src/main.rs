@@ -1,16 +1,27 @@
+use account_sdk::abigen::controller::OutsideExecutionV3;
+use cainome_cairo_serde::CairoSerde;
 use clap::Parser;
 use clap::ValueEnum;
 use once_cell::sync::Lazy;
+use starknet::core::types::ContractClass;
+use starknet::core::types::InvokeTransaction;
+use starknet::core::types::Transaction;
+use starknet::core::types::contract::AbiEntry;
+use starknet::core::types::contract::AbiFunction;
 use starknet::core::types::requests::GetTransactionReceiptRequest;
 use starknet::core::types::{BlockId, BlockTag, EventFilter, Felt, TransactionReceipt};
+use starknet::core::utils::get_selector_from_name;
 use starknet::macros::felt;
+use starknet::macros::selector;
 use starknet::providers::jsonrpc::HttpTransport;
 use starknet::providers::{JsonRpcClient, Provider, ProviderRequestData, ProviderResponseData};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use thiserror::Error;
+use tracing::trace;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
@@ -30,6 +41,31 @@ const TX_HASH_BATCH_SIZE: usize = 1000;
 
 /// The chunk size for fetching events, 1024 being the maximum value for pathfinder.
 const EVENT_CHUNK_SIZE: u64 = 1024;
+
+/// Cache for storing contract function selectors mapped to function names.
+/// We don't need to keep the contract context since selectors are unique across the whole network.
+type FunctionCache = Arc<Mutex<HashMap<Felt, String>>>;
+
+/// Initialize the function cache
+fn init_function_cache() -> FunctionCache {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Get function name from cache, or return None if not found
+fn get_function_name(cache: &FunctionCache, selector: Felt) -> Option<String> {
+    cache.lock().unwrap().get(&selector).cloned()
+}
+
+/// Store function name in cache
+fn store_function_name(cache: &FunctionCache, selector: Felt, function_name: String) {
+    let mut cache_guard = cache.lock().unwrap();
+    cache_guard.insert(selector, function_name);
+}
+
+/// The transaction info gathered for high step count transactions.
+struct HighStepTxInfo {
+    pub entrypoints_names: Vec<String>,
+}
 
 pub static CONTRACTS: Lazy<HashMap<&str, (Felt, u64, String)>> = Lazy::new(|| {
     HashMap::from([
@@ -61,7 +97,8 @@ pub static CONTRACTS: Lazy<HashMap<&str, (Felt, u64, String)>> = Lazy::new(|| {
             "Ryo",
             (
                 felt!("0x4f3dccb47477c087ad9c76b8067b8aadded57f8df7f2d7543e6066bcb25332c"),
-                889000,
+                //889000,
+                909695, // debug for big tx.
                 String::from(CARTRIDGE_NODE_MAINNET),
             ),
         ),
@@ -141,6 +178,7 @@ async fn main() -> Result<(), FetchError> {
     let (contract_address, start_block, rpc, contract_name) = parse_contract_config(&args);
 
     let mut output_file = setup_file(&format!("/tmp/{}.log", contract_name));
+    let mut function_cache = init_function_cache();
 
     let filter_layer = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -205,7 +243,13 @@ async fn main() -> Result<(), FetchError> {
 
         if tx_hash_queue.len() >= TX_HASH_BATCH_SIZE {
             let batch: Vec<Felt> = tx_hash_queue.drain(..TX_HASH_BATCH_SIZE).collect();
-            fetch_and_process_txs_receipts(&provider, &batch, &mut output_file).await?;
+            fetch_and_process_txs_receipts(
+                &provider,
+                &batch,
+                &mut output_file,
+                &mut function_cache,
+            )
+            .await?;
         }
 
         continuation_token = events_page.continuation_token;
@@ -217,7 +261,8 @@ async fn main() -> Result<(), FetchError> {
     // We need to make sure we drain remainig tx if we don't reach the tx batch size:
     if !tx_hash_queue.is_empty() {
         let batch: Vec<Felt> = tx_hash_queue.drain(..).collect();
-        fetch_and_process_txs_receipts(&provider, &batch, &mut output_file).await?;
+        fetch_and_process_txs_receipts(&provider, &batch, &mut output_file, &mut function_cache)
+            .await?;
     }
 
     info!("Total events fetched: {total_events}");
@@ -231,6 +276,7 @@ async fn fetch_and_process_txs_receipts<P: Provider + Sync + Send + 'static>(
     provider: &Arc<P>,
     tx_hashes: &[Felt],
     output_file: &mut File,
+    function_cache: &mut FunctionCache,
 ) -> Result<(), FetchError> {
     let receipts = fetch_receipts_batch(provider, tx_hashes).await?;
     let mut high_step_count = 0;
@@ -241,15 +287,30 @@ async fn fetch_and_process_txs_receipts<P: Provider + Sync + Send + 'static>(
 
             if steps > TX_STEPS_THRESHOLD {
                 high_step_count += 1;
-                println!("{:#066x} ({} steps)", r.transaction_hash, steps);
-                writeln!(output_file, "{:#066x} {} *", r.transaction_hash, steps).unwrap();
+                debug!("{:#066x} ({} steps)", r.transaction_hash, steps);
+
+                if let Some(tx_info) =
+                    fetch_and_parse_transaction(r.transaction_hash, function_cache, provider)
+                        .await?
+                {
+                    writeln!(
+                        output_file,
+                        "{:#066x} {} * {}",
+                        r.transaction_hash,
+                        steps,
+                        tx_info.entrypoints_names.join(", ")
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(output_file, "{:#066x} {} *", r.transaction_hash, steps).unwrap();
+                }
             } else {
                 writeln!(output_file, "{:#066x} {}", r.transaction_hash, steps).unwrap();
             }
         }
     }
 
-    info!(
+    debug!(
         "Fetched {} receipts (batch), {} with > {} steps",
         receipts.len(),
         high_step_count,
@@ -285,6 +346,55 @@ async fn fetch_receipts_batch<P: Provider + Sync + Send + 'static>(
     Ok(receipts)
 }
 
+/// Parse and display transaction calldata with function names
+async fn fetch_and_parse_transaction<P: Provider + Sync + Send + 'static>(
+    tx_hash: Felt,
+    function_cache: &mut FunctionCache,
+    provider: &Arc<P>,
+) -> Result<Option<HighStepTxInfo>, FetchError> {
+    trace!(tx_hash = ?tx_hash, "Fetching full transaction.");
+
+    let tx = match provider.get_transaction_by_hash(tx_hash).await? {
+        Transaction::Invoke(InvokeTransaction::V3(tx)) => Some(tx),
+        _ => None,
+    };
+
+    if tx.is_none() {
+        debug!(tx_hash = ?tx_hash, "Not an invoke v3 transaction.");
+        return Ok(None);
+    }
+
+    let tx = tx.unwrap();
+
+    if tx.calldata.is_empty() {
+        debug!(tx_hash = ?tx_hash, "Calldata is empty.");
+        return Ok(None);
+    }
+
+    // We're looking for `execution_from_outside_v3` since most of txs are controller txs.
+    // The first call is being parsed, and the selector is the third element in this array (since execution from outside itself is not multicalled).
+    if tx.calldata[2] != selector!("execute_from_outside_v3") {
+        debug!(tx_hash = ?tx_hash, "Not an execution from outside v3 transaction.");
+        return Ok(None);
+    }
+
+    let mut entrypoints_names: Vec<String> = vec![];
+    let efo = OutsideExecutionV3::cairo_deserialize(&tx.calldata, 4).unwrap();
+
+    for call in &efo.calls {
+        let function_name = if let Some(n) = get_function_name(function_cache, call.selector) {
+            n
+        } else {
+            fetch_and_decode_entrypoints(call.to.into(), provider, function_cache).await?;
+            get_function_name(function_cache, call.selector).unwrap()
+        };
+
+        entrypoints_names.push(function_name);
+    }
+
+    Ok(Some(HighStepTxInfo { entrypoints_names }))
+}
+
 /// Ensures the file is deleted and recreated blank since we only append after.
 fn setup_file(file_name: &str) -> File {
     if let Err(e) = std::fs::remove_file(file_name) {
@@ -313,5 +423,215 @@ fn parse_contract_config(args: &Args) -> (Felt, u64, String, String) {
     } else {
         error!("No contract specified");
         std::process::exit(1);
+    }
+}
+
+/// Fetch the ABI of a contract and store the function selectors mapped to their names in the cache.
+async fn fetch_and_decode_entrypoints<P: Provider + Sync + Send + 'static>(
+    contract_address: Felt,
+    provider: &Arc<P>,
+    function_cache: &mut FunctionCache,
+) -> Result<(), FetchError> {
+    /// An AbiEntry that is a function can be embedded in an interface (which is then implemented).
+    /// This function is handy to re-use the same code for both functions and implementations.
+    fn decode_function(function: &AbiFunction, function_cache: &mut FunctionCache) {
+        let name = function.name.clone();
+        let selector = get_selector_from_name(&function.name).expect("Invalid function name");
+        debug!(function_name = name, selector = ?selector, "Registering mapping for function");
+        store_function_name(function_cache, selector, name);
+    }
+    trace!("Fetching ABI for contract: {:#x}", contract_address);
+
+    let class = provider
+        .get_class_at(BlockId::Tag(BlockTag::Latest), contract_address)
+        .await?;
+
+    if let ContractClass::Sierra(class) = class {
+        // Parse the string into a vector of ABI entries.
+        let abi = serde_json::from_str::<Vec<AbiEntry>>(&class.abi).unwrap();
+        for entry in abi {
+            if let AbiEntry::Function(function) = entry {
+                decode_function(&function, function_cache);
+            } else if let AbiEntry::Interface(intf) = entry {
+                for item in &intf.items {
+                    if let AbiEntry::Function(function) = item {
+                        decode_function(function, function_cache);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec;
+
+    use cainome_cairo_serde::ContractAddress;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_transaction() {
+        let calldata = vec![
+            felt!("0x1"),
+            felt!("0x599fba85695cd0256d941058dc671865a579caf1bb2f3db48a8104049c40f76"),
+            felt!("0x3dbc508ba4afd040c8dc4ff8a61113a7bcaf5eae88a6ba27b3c50578b3587e3"),
+            felt!("0x80"),
+            felt!("0x414e595f43414c4c4552"),
+            felt!("0x712319389626fc77df104be2dff5130fdda066744f23be18451e4bbd0be1a0b"),
+            felt!("0x10000000"),
+            felt!("0x0"),
+            felt!("0x673b1e09"),
+            felt!("0x1"),
+            felt!("0x412445e644070c69fea16b964cc81cd6debf6a4dbf683e2e9686a45ad088de8"),
+            felt!("0x3566d0e92bdb2d2b96b481893c1a23f1526a9009dbc1d59cc137b805bf1ef09"),
+            felt!("0x3"),
+            felt!("0x53b"),
+            felt!("0x0"),
+            felt!("0x0"),
+            felt!("0x73"),
+            felt!("0x73657373696f6e2d746f6b656e"),
+            felt!("0x673b221e"),
+            felt!("0x6bfdbfca6eb646cfacdcc3132b026ddbf4f87ffc21c4d4d8cda4730a4317896"),
+            felt!("0x0"),
+            felt!("0x1ccbac3cd14161657b3a4f6d0deeb2ffdd0c7a13c70150d980ee81bd200573a"),
+            felt!("0x0"),
+            felt!("0x1"),
+            felt!("0x5d"),
+            felt!("0x1"),
+            felt!("0x4"),
+            felt!("0x16"),
+            felt!("0x68"),
+            felt!("0x74"),
+            felt!("0x74"),
+            felt!("0x70"),
+            felt!("0x73"),
+            felt!("0x3a"),
+            felt!("0x2f"),
+            felt!("0x2f"),
+            felt!("0x78"),
+            felt!("0x2e"),
+            felt!("0x63"),
+            felt!("0x61"),
+            felt!("0x72"),
+            felt!("0x74"),
+            felt!("0x72"),
+            felt!("0x69"),
+            felt!("0x64"),
+            felt!("0x67"),
+            felt!("0x65"),
+            felt!("0x2e"),
+            felt!("0x67"),
+            felt!("0x67"),
+            felt!("0x9d0aec9905466c9adf79584fa75fed3"),
+            felt!("0x20a97ec3f8efbc2aca0cf7cabb420b4a"),
+            felt!("0x652ab69a7689cb2beec6a231a6967b6"),
+            felt!("0x519fef2adbadba35febf8242b5e6c95e"),
+            felt!("0x38"),
+            felt!("0x2c"),
+            felt!("0x22"),
+            felt!("0x63"),
+            felt!("0x72"),
+            felt!("0x6f"),
+            felt!("0x73"),
+            felt!("0x73"),
+            felt!("0x4f"),
+            felt!("0x72"),
+            felt!("0x69"),
+            felt!("0x67"),
+            felt!("0x69"),
+            felt!("0x6e"),
+            felt!("0x22"),
+            felt!("0x3a"),
+            felt!("0x74"),
+            felt!("0x72"),
+            felt!("0x75"),
+            felt!("0x65"),
+            felt!("0x2c"),
+            felt!("0x22"),
+            felt!("0x74"),
+            felt!("0x6f"),
+            felt!("0x70"),
+            felt!("0x4f"),
+            felt!("0x72"),
+            felt!("0x69"),
+            felt!("0x67"),
+            felt!("0x69"),
+            felt!("0x6e"),
+            felt!("0x22"),
+            felt!("0x3a"),
+            felt!("0x22"),
+            felt!("0x68"),
+            felt!("0x74"),
+            felt!("0x74"),
+            felt!("0x70"),
+            felt!("0x73"),
+            felt!("0x3a"),
+            felt!("0x2f"),
+            felt!("0x2f"),
+            felt!("0x64"),
+            felt!("0x6f"),
+            felt!("0x70"),
+            felt!("0x65"),
+            felt!("0x77"),
+            felt!("0x61"),
+            felt!("0x72"),
+            felt!("0x73"),
+            felt!("0x2e"),
+            felt!("0x67"),
+            felt!("0x61"),
+            felt!("0x6d"),
+            felt!("0x65"),
+            felt!("0x22"),
+            felt!("0x7d"),
+            felt!("0x1d"),
+            felt!("0x0"),
+            felt!("0x490ca32eb2f25fed754f38b80a8caf3b"),
+            felt!("0x45344d3726eeb7dd1a587c9fceb1f52c"),
+            felt!("0x9d2fbf5ba26dfcb01ddfbb4777b9267a"),
+            felt!("0x4e523bb067e9278bbf6a3ab674141199"),
+            felt!("0x1"),
+            felt!("0x0"),
+            felt!("0x387ceb5dba2c8421dd8d9079bda028b2114ec2dcdf6d08804384ed957fa4811"),
+            felt!("0x9f29837fded7fd9a880618130ff34e40719ba5b5e08904ebc230b540031677"),
+            felt!("0x3334974a55f177bb9360a3fdd9842d12b04da19205f659ed0fbc3d09e8c1907"),
+            felt!("0x0"),
+            felt!("0x1e6a6f52e47fe42e024287b729bc47e58019fcc7e1cc8b141bb8d669b779b49"),
+            felt!("0x7584ecaf1a8ea43fc320afd26a3aa30e06ce9e66c7072df16b1c8ffeeaf25f8"),
+            felt!("0x3fbda068d411a3a073ace1ac743313fc824e934c7225a496ebf2f236f40878d"),
+            felt!("0x1"),
+            felt!("0x4"),
+            felt!("0x6a27fe137c608490340c28b0ab69a0abe8d4790b073025223cf8ff2b4a7ceb4"),
+            felt!("0x4db42e8fa0ddd7f00d3d27a6e870d22c12e22b0e2f2ed5397e39d0a3489d34f"),
+            felt!("0x42f12923b5c50589fe41fde45543cc7482389d0b3280de1217170d19fddb80a"),
+            felt!("0x3523e5773ef65babf5af31cadd832d3268613d2aabedfc9528f294cb43c17b8"),
+        ];
+
+        let efo = OutsideExecutionV3::cairo_deserialize(&calldata, 4).unwrap();
+        assert_eq!(
+            efo.caller,
+            ContractAddress::from(felt!("0x414e595f43414c4c4552"))
+        );
+        assert_eq!(
+            efo.nonce,
+            (
+                felt!("0x712319389626fc77df104be2dff5130fdda066744f23be18451e4bbd0be1a0b"),
+                0x10000000_u128
+            )
+        );
+        assert_eq!(efo.execute_after, 0_u64);
+        assert_eq!(efo.execute_before, 0x673b1e09_u64);
+        assert_eq!(efo.calls.len(), 1);
+
+        assert_eq!(
+            efo.calls[0].to,
+            ContractAddress::from(felt!(
+                "0x412445e644070c69fea16b964cc81cd6debf6a4dbf683e2e9686a45ad088de8"
+            ))
+        );
+        assert_eq!(efo.calls[0].selector, selector!("register_score"));
     }
 }
